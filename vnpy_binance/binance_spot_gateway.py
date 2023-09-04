@@ -39,6 +39,8 @@ from vnpy_websocket import WebsocketClient
 from asyncio import (
     run_coroutine_threadsafe
 )
+from binance.websocket.spot.websocket_stream import SpotWebsocketStreamClient
+import json
 
 # 中国时区
 CHINA_TZ = pytz.timezone("Asia/Shanghai")
@@ -128,7 +130,7 @@ class BinanceSpotGateway(BaseGateway):
         super().__init__(event_engine, gateway_name)
 
         self.trade_ws_api: "BinanceSpotTradeWebsocketApi" = BinanceSpotTradeWebsocketApi(self)
-        self.market_ws_api: "BinanceSpotDataWebsocketApi" = BinanceSpotDataWebsocketApi(self)
+        self.market_ws_api: "BinanceSpotDataStream" = BinanceSpotDataStream(self)
         self.rest_api: "BinanceSpotRestAPi" = BinanceSpotRestAPi(self)
 
         self.orders: Dict[str, OrderData] = {}
@@ -892,6 +894,74 @@ class BinanceSpotDataWebsocketApi(WebsocketClient):
         if tick.last_price:
             tick.localtime = datetime.now()
             self.gateway.on_tick(copy(tick))
+
+    def on_disconnected(self) -> None:
+        """连接断开回报"""
+        self.gateway.write_log("行情Websocket API断开")
+
+
+class BinanceSpotDataStream():
+    """币安现货行情Websocket API"""
+
+    def __init__(self, gateway: BinanceSpotGateway) -> None:
+        """构造函数"""
+        super().__init__()
+
+        self.gateway: BinanceSpotGateway = gateway
+        self.gateway_name: str = gateway.gateway_name
+
+        self.ticks: Dict[str, TickData] = {}
+
+    def connect(self, proxy_host: str, proxy_port: int, server: str):
+        """连接Websocket行情频道"""
+        if server == "REAL":
+            self.market_ws_api = SpotWebsocketStreamClient(on_message=self.message_handler)
+        else:
+            self.market_ws_api = SpotWebsocketStreamClient(stream_url=TESTNET_WEBSOCKET_DATA_HOST, on_message=self.message_handler)
+
+        self.market_ws_api.ticker()
+    
+    def message_handler(self, _, message):
+        payload = json.loads(message)
+        for data in payload:
+            symbol = str(data['s']).lower()
+            if symbol not in self.ticks.keys():
+                continue
+            tick: TickData = self.ticks[symbol]
+            tick.volume = float(data['v'])
+            tick.turnover = float(data['q'])
+            tick.open_price = float(data['o'])
+            tick.high_price = float(data['h'])
+            tick.low_price = float(data['l'])
+            tick.last_price = float(data['c'])
+            tick.datetime = generate_datetime(float(data['E']))
+        # send all tick message
+        for tick in self.ticks.values():
+            if tick.last_price:
+                tick.localtime = datetime.now()
+                self.gateway.on_tick(copy(tick))
+
+    def subscribe(self, req: SubscribeRequest) -> None:
+        """订阅行情"""
+        if req.symbol in self.ticks:
+            return
+
+        if req.symbol not in symbol_contract_map:
+            self.gateway.write_log(f"找不到该合约代码{req.symbol}")
+            return
+
+        # 创建TICK对象
+        tick: TickData = TickData(
+            symbol=req.symbol,
+            name=symbol_contract_map[req.symbol].name,
+            exchange=Exchange.BINANCE,
+            datetime=datetime.now(CHINA_TZ),
+            gateway_name=self.gateway_name,
+        )
+        self.ticks[req.symbol] = tick
+
+    def stop(self) -> None:
+        self.market_ws_api.stop()
 
     def on_disconnected(self) -> None:
         """连接断开回报"""
